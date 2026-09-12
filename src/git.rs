@@ -15,7 +15,7 @@ pub fn get_recent_changes() -> Option<String> {
 
     // 2. Try to get uncommitted changes first (working directory diff)
     let mut diff = Command::new("git")
-        .args(["--no-pager", "diff", "HEAD"])
+        .args(["--no-pager", "diff", "--no-color", "HEAD"])
         .stdin(Stdio::null())
         .output()
         .ok()
@@ -25,7 +25,7 @@ pub fn get_recent_changes() -> Option<String> {
     // 3. If no uncommitted changes, get the last commit
     if diff.trim().is_empty() {
         diff = Command::new("git")
-            .args(["--no-pager", "show", "HEAD"])
+            .args(["--no-pager", "show", "--no-color", "HEAD"])
             .stdin(Stdio::null())
             .output()
             .ok()

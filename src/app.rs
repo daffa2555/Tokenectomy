@@ -104,7 +104,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
                 "Set `--yes` to auto-approve reading files outside the directory.",
                 "Ensure your Ollama daemon is running if you use local mode."
             ];
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             let tip = tips[(now as usize) % tips.len()];
             println!("{} {}\n", "✦ Tip:".bright_black().bold(), tip.bright_black());
 
@@ -113,7 +113,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
             let mut line = String::new();
             loop {
                 print!("razor> ");
-                std::io::stdout().flush().unwrap();
+                let _ = std::io::stdout().flush();
                 let n = io::stdin().read_line(&mut line)?;
                 if n == 0 { break; } // Ctrl+D
                 
@@ -128,7 +128,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
                     use clap::CommandFactory;
                     let mut cmd = Cli::command();
                     println!("\n");
-                    cmd.print_help().unwrap();
+                    let _ = cmd.print_help();
                     println!("\n(You are still in REPL mode. Paste log or type /exit)\n");
                 } else if trimmed == "/clear" {
                     log.clear();
@@ -237,7 +237,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
         indicatif::ProgressStyle::default_spinner()
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""])
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner())
     );
     pb.set_message("Analyzing error with AI...");
 

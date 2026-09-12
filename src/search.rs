@@ -99,8 +99,8 @@ fn clean_query(raw: &str) -> String {
     res.chars().take(100).collect()
 }
 
-pub async fn search_stackoverflow(log: &str) -> Option<String> {
-    let query = extract_error_query(log)?;
+pub async fn search_stackoverflow(input: &str) -> Option<String> {
+    let query = extract_error_query(input).unwrap_or_else(|| clean_query(input));
     if query.trim().is_empty() {
         return None;
     }
@@ -124,12 +124,18 @@ pub async fn search_stackoverflow(log: &str) -> Option<String> {
 
     if let Some(items) = json.get("items").and_then(|i| i.as_array()) {
         for item in items.iter().take(3) {
-            if let (Some(title), Some(link), Some(is_answered)) = (
+            if let (Some(title_raw), Some(link), Some(is_answered)) = (
                 item.get("title"),
                 item.get("link"),
                 item.get("is_answered"),
             ) {
-                let title = title.as_str().unwrap_or("");
+                let raw_str = title_raw.as_str().unwrap_or("");
+                let title = raw_str
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">");
                 let link = link.as_str().unwrap_or("");
                 let answered = if is_answered.as_bool().unwrap_or(false) {
                     "✅ Answered"

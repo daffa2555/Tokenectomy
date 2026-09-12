@@ -96,6 +96,28 @@ fn run_command_with_timeout(
     }
 }
 
+fn find_ast_syntax_error(node: &tree_sitter::Node) -> Option<(usize, usize, &'static str)> {
+    let count = node.child_count();
+    for i in 0..count {
+        if let Some(child) = node.child(i) {
+            if child.has_error() {
+                if let Some(err) = find_ast_syntax_error(&child) {
+                    return Some(err);
+                }
+            }
+        }
+    }
+    if node.is_error() {
+        let pos = node.start_position();
+        return Some((pos.row + 1, pos.column + 1, "syntax error"));
+    }
+    if node.is_missing() {
+        let pos = node.start_position();
+        return Some((pos.row + 1, pos.column + 1, "missing expected token"));
+    }
+    None
+}
+
 pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         match ext {
@@ -132,7 +154,11 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                     if let Ok(source) = std::fs::read_to_string(path) {
                         if let Some(tree) = parser.parse(&source, None) {
                             if tree.root_node().has_error() {
-                                return Err("Python syntax error detected by Tree-sitter AST parser".to_string());
+                                if let Some((row, col, kind)) = find_ast_syntax_error(&tree.root_node()) {
+                                    return Err(format!("Python syntax error on line {}:{} ({})", row, col, kind));
+                                } else {
+                                    return Err("Python syntax error detected by Tree-sitter AST parser".to_string());
+                                }
                             }
                         }
                     }
@@ -246,10 +272,11 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
 }
 
 pub async fn run_server() -> anyhow::Result<()> {
-    let boundary = WorkspaceBoundary::current().unwrap_or_else(|_| {
-        WorkspaceBoundary::new(std::env::current_dir().unwrap_or_default())
-            .expect("workspace boundary initialization")
-    });
+    let boundary = WorkspaceBoundary::current()
+        .or_else(|_| WorkspaceBoundary::new(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))))
+        .or_else(|_| WorkspaceBoundary::new("."))
+        .or_else(|_| WorkspaceBoundary::new(std::env::temp_dir()))
+        .unwrap_or_else(|_| WorkspaceBoundary::new("/").expect("root boundary fallback"));
     let analyzer_state = crate::analyzer::AppState::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -560,16 +587,26 @@ pub async fn run_server() -> anyhow::Result<()> {
                                                     } else {
                                                         // For non-Rust files (py, js, ts, go, json, toml, yaml, php), test against an isolated sandbox temp file
                                                         // without ever touching or modifying the actual target file on disk!
+                                                        static DRY_RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                                        let counter = DRY_RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                         let updated = content.replacen(&target_orig, &target_new, 1);
                                                         let ext = safe_path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
                                                         let temp_file = safe_path.with_file_name(format!(
-                                                            ".dry_run_{}.tmp.{}",
+                                                            ".dry_run_{}_{}.tmp.{}",
                                                             std::process::id(),
+                                                            counter,
                                                             ext
                                                         ));
                                                         let _ = std::fs::write(&temp_file, updated.as_bytes());
+                                                        struct TempFileGuard(std::path::PathBuf);
+                                                        impl Drop for TempFileGuard {
+                                                            fn drop(&mut self) {
+                                                                let _ = std::fs::remove_file(&self.0);
+                                                            }
+                                                        }
+                                                        let _guard = TempFileGuard(temp_file.clone());
                                                         let verify_result = verify_patch(&temp_file);
-                                                        let _ = std::fs::remove_file(&temp_file);
+                                                        drop(_guard);
 
                                                         match verify_result {
                                                             Ok(_) => Some(success_response(

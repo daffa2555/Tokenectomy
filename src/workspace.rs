@@ -160,6 +160,13 @@ impl WorkspaceBoundary {
         if !safe_path.is_file() {
             return Err(BoundaryError::NotFound(safe_path));
         }
+        let meta = fs::metadata(&safe_path)?;
+        if meta.len() > 10 * 1024 * 1024 {
+            return Err(BoundaryError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("File '{}' exceeds 10MB size limit ({} bytes)", safe_path.display(), meta.len()),
+            )));
+        }
         let content = fs::read_to_string(&safe_path)?;
         Ok(content)
     }
@@ -167,13 +174,15 @@ impl WorkspaceBoundary {
     /// Writes data safely to a file within the workspace boundary using atomic write-and-rename.
     /// Ensures parent directories exist and guarantees zero corrupt diff on process crash.
     pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, content: C) -> Result<(), BoundaryError> {
+        static WRITE_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let safe_path = self.resolve(path)?;
         let parent = safe_path.parent().unwrap_or(&self.root);
         if !parent.exists() {
             fs::create_dir_all(parent)?;
         }
         let file_name = safe_path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
-        let tmp_path = parent.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+        let counter = WRITE_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{}.tmp.{}_{}", file_name, std::process::id(), counter));
         fs::write(&tmp_path, content)?;
         fs::rename(&tmp_path, &safe_path)?;
         Ok(())

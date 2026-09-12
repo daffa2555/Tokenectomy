@@ -184,6 +184,38 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 
+/// Decodes an HTTP/1.1 chunked transfer-encoded byte slice (RFC 7230 §4.1) into raw body bytes.
+pub fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut decoded = Vec::new();
+    loop {
+        if input.is_empty() {
+            return Err("Unexpected EOF in chunked body");
+        }
+        let nl = match input.windows(2).position(|w| w == b"\r\n") {
+            Some(pos) => pos,
+            None => return Err("Missing CRLF after chunk size"),
+        };
+        let size_str = std::str::from_utf8(&input[..nl]).map_err(|_| "Invalid UTF-8 in chunk size")?;
+        let hex_size = size_str.split(';').next().unwrap_or("").trim();
+        let chunk_len = usize::from_str_radix(hex_size, 16).map_err(|_| "Invalid hex in chunk size")?;
+
+        if chunk_len == 0 {
+            return Ok(decoded);
+        }
+
+        let data_start = nl + 2;
+        let data_end = data_start + chunk_len;
+        if input.len() < data_end + 2 {
+            return Err("Incomplete chunk data");
+        }
+        decoded.extend_from_slice(&input[data_start..data_end]);
+        if &input[data_end..data_end + 2] != b"\r\n" {
+            return Err("Missing CRLF after chunk data");
+        }
+        input = &input[data_end + 2..];
+    }
+}
+
 /// Checks if a bind address is strictly local loopback (127.0.0.1, localhost, ::1).
 pub fn is_loopback(bind_addr: &str) -> bool {
     let clean = bind_addr.trim();
@@ -397,6 +429,7 @@ pub async fn run_reverse_proxy_configured(
 
                 // Extract Content-Length & Authorization, and collect client headers for upstream forwarding
                 let mut content_length = 0;
+                let mut is_chunked = false;
                 let mut client_auth = None;
                 let mut forward_headers = Vec::new();
 
@@ -408,6 +441,8 @@ pub async fn run_reverse_proxy_configured(
 
                         if k_lower == "content-length" {
                             content_length = v_clean.parse::<usize>().unwrap_or(0);
+                        } else if k_lower == "transfer-encoding" && v_clean.to_ascii_lowercase().contains("chunked") {
+                            is_chunked = true;
                         } else if k_lower == "authorization" {
                             client_auth = Some(v_clean.to_string());
                         } else if k_lower == "x-api-key" && client_auth.is_none() {
@@ -444,24 +479,62 @@ pub async fn run_reverse_proxy_configured(
                     }
                 }
 
-                // Enforce MAX_BODY_SIZE
-                if content_length > MAX_BODY_SIZE {
-                    let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"Payload exceeds 10MB limit\",\"code\":413}}\r\n";
-                    let _ = socket.write_all(resp.as_bytes()).await;
-                    return;
-                }
-
-                // Read remaining body
-                let mut body_bytes = buf[body_start..total_read].to_vec();
-                while body_bytes.len() < content_length {
-                    let to_read = (content_length - body_bytes.len()).min(16384);
-                    let mut temp = vec![0u8; to_read];
-                    match socket.read(&mut temp).await {
-                        Ok(0) => break,
-                        Ok(n) => body_bytes.extend_from_slice(&temp[..n]),
-                        Err(_) => break,
+                // Read body (either chunked or Content-Length framed)
+                let body_bytes = if is_chunked {
+                    let mut raw_chunked_bytes = buf[body_start..total_read].to_vec();
+                    while raw_chunked_bytes.len() < MAX_BODY_SIZE {
+                        if raw_chunked_bytes.windows(5).any(|w| w == b"0\r\n\r\n") {
+                            break;
+                        }
+                        let mut temp = vec![0u8; 8192];
+                        match socket.read(&mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw_chunked_bytes.extend_from_slice(&temp[..n]);
+                                if raw_chunked_bytes.windows(5).any(|w| w == b"0\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
-                }
+
+                    if raw_chunked_bytes.len() >= MAX_BODY_SIZE {
+                        let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"Payload exceeds 10MB limit\",\"code\":413}}\r\n";
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    match decode_chunked_body(&raw_chunked_bytes) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let resp = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"error\":{{\"message\":\"Malformed chunked transfer body: {}\",\"code\":400}}}}\r\n",
+                                e
+                            );
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                    }
+                } else {
+                    if content_length > MAX_BODY_SIZE {
+                        let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"Payload exceeds 10MB limit\",\"code\":413}}\r\n";
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    let mut bytes = buf[body_start..total_read].to_vec();
+                    while bytes.len() < content_length {
+                        let to_read = (content_length - bytes.len()).min(16384);
+                        let mut temp = vec![0u8; to_read];
+                        match socket.read(&mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => bytes.extend_from_slice(&temp[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    bytes
+                };
 
                 // Handle /v1/analyze or /analyze directly on the gateway (#17, #18, #19, #20)
                 if method == "POST" && (path == "/v1/analyze" || path == "/analyze") {
@@ -551,9 +624,11 @@ pub async fn run_reverse_proxy_configured(
                 if let Some(auth) = client_auth {
                     req_builder = req_builder.header("Authorization", auth);
                 }
-                req_builder = req_builder
-                    .header("Content-Type", "application/json")
-                    .body(final_body);
+                if !final_body.is_empty() {
+                    req_builder = req_builder
+                        .header("Content-Type", "application/json")
+                        .body(final_body);
+                }
 
                 match req_builder.send().await {
                     Ok(mut upstream_resp) => {

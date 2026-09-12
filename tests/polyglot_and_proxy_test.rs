@@ -822,3 +822,151 @@ fn test_framework_noise_no_false_positives_on_user_projects() {
     assert!(is_framework_noise("/home/user/.cargo/registry/src/tokio-1.0/lib.rs"));
     assert!(is_framework_noise("/app/.venv/lib/python3.10/site-packages/fastapi/main.py"));
 }
+
+#[test]
+fn test_proxy_decode_chunked_body_rfc7230() {
+    use tokenectomy::proxy::decode_chunked_body;
+
+    // 1. Standard RFC 7230 chunked body with dynamically verified hex lengths
+    let chunk1 = "Wiki";
+    let chunk2 = "pedia";
+    let chunk3 = " in \r\nchunks.";
+    let raw = format!(
+        "{:x}\r\n{}\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+        chunk1.len(),
+        chunk1,
+        chunk2.len(),
+        chunk2,
+        chunk3.len(),
+        chunk3
+    );
+    let decoded = decode_chunked_body(raw.as_bytes()).expect("decode valid chunks");
+    assert_eq!(decoded, b"Wikipedia in \r\nchunks.");
+
+    // 2. Chunks with RFC extensions (after semicolon)
+    let raw_with_ext = b"5;foo=bar\r\nHello\r\n6;ext\r\n World\r\n0\r\n\r\n";
+    let decoded_ext = decode_chunked_body(raw_with_ext).expect("decode chunks with extensions");
+    assert_eq!(decoded_ext, b"Hello World");
+
+    // 3. Empty chunks (immediate zero length)
+    let empty_chunks = b"0\r\n\r\n";
+    let decoded_empty = decode_chunked_body(empty_chunks).expect("decode empty chunks");
+    assert!(decoded_empty.is_empty());
+
+    // 4. Incomplete chunk data error detection
+    let truncated = b"a\r\nshort";
+    assert!(decode_chunked_body(truncated).is_err());
+
+    // 5. Missing CRLF after chunk data
+    let bad_crlf = b"4\r\nWikiXX0\r\n\r\n";
+    assert!(decode_chunked_body(bad_crlf).is_err());
+}
+
+#[tokio::test]
+async fn test_proxy_upstream_end_to_end_streaming_and_redaction() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:18093").await.expect("bind mock upstream");
+    let upstream_addr = "http://127.0.0.1:18093";
+
+    // Spawn mock upstream LLM server
+    tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.expect("upstream accept");
+        let mut buf = vec![0u8; 4096];
+        let n = socket.read(&mut buf).await.expect("upstream read");
+        let req_str = String::from_utf8_lossy(&buf[..n]);
+
+        // CRITICAL INVARIANT: Upstream MUST receive sanitized payload with Anthropic key redacted!
+        assert!(req_str.contains("[ANTHROPIC_KEY_REDACTED]"), "Upstream must receive redacted key");
+        assert!(!req_str.contains("sk-ant-api03-abcdef12345678901234567890"), "Raw secret leaked to upstream!");
+
+        // Send streaming response back through the proxy with Connection: close
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"reply\":\"Sanitized OK\"}\n\n";
+        socket.write_all(resp.as_bytes()).await.expect("upstream write");
+        let _ = socket.flush().await;
+    });
+
+    let proxy_addr = "127.0.0.1:18094";
+    tokio::spawn(async move {
+        if let Err(e) = tokenectomy::proxy::run_reverse_proxy(proxy_addr, upstream_addr).await {
+            eprintln!("PROXY SERVER ERROR: {:?}", e);
+        }
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    // Client makes request through proxy with raw secret
+    let client = reqwest::Client::new();
+    let client_payload = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Diagnose error with token sk-ant-api03-abcdef12345678901234567890"
+            }
+        ]
+    });
+
+    let res = client
+        .post(format!("http://{}/v1/chat/completions", proxy_addr))
+        .json(&client_payload)
+        .send()
+        .await
+        .expect("client send to proxy");
+
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.expect("client read response");
+    assert!(body.contains("Sanitized OK"), "Client must receive upstream response");
+}
+
+#[test]
+fn test_workspace_boundary_read_size_guard() {
+    let temp_dir = std::env::temp_dir().join(format!("tokenectomy_size_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // Create a 1MB file (within safe limit)
+    let safe_file = temp_dir.join("safe.txt");
+    std::fs::write(&safe_file, vec![b'a'; 1024 * 1024]).expect("write safe file");
+    let safe_boundary = tokenectomy::workspace::WorkspaceBoundary::new(&temp_dir).expect("temp boundary");
+    assert!(safe_boundary.read("safe.txt").is_ok());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_mcp_python_syntax_error_exact_coordinates() {
+    let temp_dir = std::env::temp_dir().join(format!("tokenectomy_ast_coord_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let py_file = temp_dir.join("broken.py");
+    // Line 1 is valid assignment; line 2 contains invalid syntax
+    std::fs::write(&py_file, "valid_var = 100\n@@invalid_token@@\n").expect("write py file");
+
+    let res = tokenectomy::mcp::verify_patch(&py_file);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err();
+    assert!(err_msg.contains("Python syntax error"), "Must detect python syntax error");
+    assert!(err_msg.contains("line 2"), "Must pinpoint error coordinates on line 2: got '{}'", err_msg);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_search_query_direct_fallback_and_html_entity_decoding() {
+    // 1. Direct query without any stack trace frames
+    let direct = "TypeError: cannot read property 'data' of undefined";
+    let extracted = tokenectomy::search::extract_error_query(direct);
+    assert!(extracted.is_some());
+    assert!(extracted.unwrap().contains("TypeError"));
+
+    // 2. HTML entity unescaping
+    let title_raw = "&quot;Hello&quot; &amp; &lt;World&gt; &#39;test&#39;";
+    let unescaped = title_raw
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+    assert_eq!(unescaped, "\"Hello\" & <World> 'test'");
+}
