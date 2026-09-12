@@ -265,6 +265,106 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                     }
                 }
             }
+            "c" | "h" => {
+                let mut cmd = std::process::Command::new("gcc");
+                cmd.args(["-fsyntax-only", path.to_str().unwrap_or("")]);
+                if let Some(parent) = path.parent() {
+                    cmd.current_dir(parent);
+                }
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let err = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                        return Err(format!("C compiler syntax check failed: {}", err));
+                    }
+                }
+            }
+            "cpp" | "cc" | "cxx" | "hpp" => {
+                let mut cmd = std::process::Command::new("g++");
+                cmd.args(["-fsyntax-only", path.to_str().unwrap_or("")]);
+                if let Some(parent) = path.parent() {
+                    cmd.current_dir(parent);
+                }
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let err = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                        return Err(format!("C++ compiler syntax check failed: {}", err));
+                    }
+                }
+            }
+            "sh" | "bash" => {
+                let mut cmd = std::process::Command::new("bash");
+                cmd.args(["-n", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let err = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                        return Err(format!("Bash syntax check failed: {}", err));
+                    }
+                }
+            }
+            "rb" => {
+                let mut cmd = std::process::Command::new("ruby");
+                cmd.args(["-c", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let err = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                        return Err(format!("Ruby syntax check failed: {}", err));
+                    }
+                }
+            }
+            "java" => {
+                static JAVAC_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let counter = JAVAC_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let temp_out = std::env::temp_dir().join(format!("javac_check_{}_{}", std::process::id(), counter));
+                let _ = std::fs::create_dir_all(&temp_out);
+                let mut cmd = std::process::Command::new("javac");
+                cmd.args(["-proc:none", "-d", temp_out.to_str().unwrap_or("."), path.to_str().unwrap_or("")]);
+                let res = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT);
+                let _ = std::fs::remove_dir_all(&temp_out);
+                if let Ok(output) = res {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let err = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                        return Err(format!("Java compiler syntax check failed: {}", err));
+                    }
+                }
+            }
+            "cs" => {
+                let mut cs_dir = path.parent();
+                let mut found_project = false;
+                let mut cmd = std::process::Command::new("dotnet");
+                cmd.args(["build", "--no-restore", "-c", "Debug"]);
+                while let Some(dir) = cs_dir {
+                    if std::fs::read_dir(dir).ok().map(|rd| {
+                        rd.filter_map(|e| e.ok()).any(|ent| {
+                            ent.path().extension().and_then(|x| x.to_str()) == Some("csproj")
+                        })
+                    }).unwrap_or(false) {
+                        cmd.current_dir(dir);
+                        found_project = true;
+                        break;
+                    }
+                    cs_dir = dir.parent();
+                }
+                if found_project {
+                    if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let err = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                            return Err(format!("C# compiler check failed: {}", err));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

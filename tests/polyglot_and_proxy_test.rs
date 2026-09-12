@@ -970,3 +970,44 @@ fn test_search_query_direct_fallback_and_html_entity_decoding() {
         .replace("&gt;", ">");
     assert_eq!(unescaped, "\"Hello\" & <World> 'test'");
 }
+
+#[test]
+fn test_verify_patch_c_cpp_bash_syntax() {
+    let temp_dir = std::env::temp_dir().join(format!("tokenectomy_c_check_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. C language syntax check
+    let valid_c = temp_dir.join("valid.c");
+    std::fs::write(&valid_c, "int calculate(int a, int b) { return a + b; }\n").expect("write valid c");
+    assert!(tokenectomy::mcp::verify_patch(&valid_c).is_ok(), "Valid C must pass verify_patch");
+
+    let broken_c = temp_dir.join("broken.c");
+    std::fs::write(&broken_c, "int broken() { @@invalid_token@@; }\n").expect("write broken c");
+    let c_res = tokenectomy::mcp::verify_patch(&broken_c);
+    assert!(c_res.is_err(), "Broken C must fail verify_patch");
+    assert!(c_res.unwrap_err().contains("C compiler syntax check failed"));
+
+    // 2. C++ language syntax check
+    let valid_cpp = temp_dir.join("valid.cpp");
+    std::fs::write(&valid_cpp, "class Calculator { public: int add(int a, int b) { return a + b; } };\n").expect("write valid cpp");
+    assert!(tokenectomy::mcp::verify_patch(&valid_cpp).is_ok(), "Valid C++ must pass verify_patch");
+
+    let broken_cpp = temp_dir.join("broken.cpp");
+    std::fs::write(&broken_cpp, "class Broken { public: void test() { @@@; } };\n").expect("write broken cpp");
+    let cpp_res = tokenectomy::mcp::verify_patch(&broken_cpp);
+    assert!(cpp_res.is_err(), "Broken C++ must fail verify_patch");
+    assert!(cpp_res.unwrap_err().contains("C++ compiler syntax check failed"));
+
+    // 3. Bash language syntax check
+    let valid_sh = temp_dir.join("valid.sh");
+    std::fs::write(&valid_sh, "#!/bin/bash\nif [ \"$1\" = \"test\" ]; then\n  echo \"OK\"\nfi\n").expect("write valid sh");
+    assert!(tokenectomy::mcp::verify_patch(&valid_sh).is_ok(), "Valid Bash must pass verify_patch");
+
+    let broken_sh = temp_dir.join("broken.sh");
+    std::fs::write(&broken_sh, "#!/bin/bash\nif [ 1 -eq 1 ]; then echo \"missing fi\"\n").expect("write broken sh");
+    let sh_res = tokenectomy::mcp::verify_patch(&broken_sh);
+    assert!(sh_res.is_err(), "Broken Bash must fail verify_patch");
+    assert!(sh_res.unwrap_err().contains("Bash syntax check failed"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
