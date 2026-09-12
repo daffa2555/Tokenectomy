@@ -803,3 +803,22 @@ fn test_search_query_preserves_language_packages() {
     assert!(query.contains("net/http"), "Must preserve language packages like net/http");
     assert!(!query.contains("/home/runner/"), "Must strip physical filesystem paths");
 }
+
+#[test]
+fn test_framework_noise_no_false_positives_on_user_projects() {
+    use tokenectomy::extractor::is_framework_noise;
+
+    // User project paths containing substrings like "vendor", "go/src", "gems"
+    assert!(!is_framework_noise("/home/user/code/vendor_portal/src/main.rs"));
+    assert!(!is_framework_noise("/app/chicago/src/handler.go"));
+    assert!(!is_framework_noise("/var/www/inventory_management/index.php"));
+    assert!(!is_framework_noise("/projects/diamonds_and_gems/game.rb"));
+    assert!(!is_framework_noise("src/vendor_client.rs"));
+
+    // Real framework and dependency noise MUST be caught
+    assert!(is_framework_noise("/home/user/project/vendor/laravel/framework/src/Container.php"));
+    assert!(is_framework_noise("/home/user/project/node_modules/express/index.js"));
+    assert!(is_framework_noise("/usr/local/go/src/runtime/panic.go"));
+    assert!(is_framework_noise("/home/user/.cargo/registry/src/tokio-1.0/lib.rs"));
+    assert!(is_framework_noise("/app/.venv/lib/python3.10/site-packages/fastapi/main.py"));
+}

@@ -38,19 +38,35 @@ fn run_command_with_timeout(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn compiler check: {}", e))?;
+
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    // Concurrently drain stdout and stderr pipes in dedicated background threads.
+    // This strictly avoids pipe buffer exhaustion deadlocks (>64KB buffer on Linux) when linters output verbose text.
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stdout_handle {
+            let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+        }
+        buf
+    });
+
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stderr_handle {
+            let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+        }
+        buf
+    });
+
     let start = std::time::Instant::now();
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = std::io::Read::read_to_end(&mut out, &mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = std::io::Read::read_to_end(&mut err, &mut stderr);
-                }
+                let stdout = out_thread.join().unwrap_or_default();
+                let stderr = err_thread.join().unwrap_or_default();
                 return Ok(std::process::Output {
                     status,
                     stdout,
@@ -61,6 +77,8 @@ fn run_command_with_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = out_thread.join();
+                    let _ = err_thread.join();
                     return Err(format!(
                         "Compiler validation timed out after {}s",
                         timeout.as_secs()
@@ -70,6 +88,8 @@ fn run_command_with_timeout(
             }
             Err(e) => {
                 let _ = child.kill();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
                 return Err(format!("Error monitoring compiler process: {}", e));
             }
         }
@@ -82,8 +102,14 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
             "rs" => {
                 let mut cmd = std::process::Command::new("cargo");
                 cmd.args(["check", "--quiet", "--message-format=short"]);
-                if let Some(parent) = path.parent() {
-                    cmd.current_dir(parent);
+                // Walk upwards to locate the nearest Cargo.toml manifest root
+                let mut manifest_dir = path.parent();
+                while let Some(dir) = manifest_dir {
+                    if dir.join("Cargo.toml").exists() {
+                        cmd.current_dir(dir);
+                        break;
+                    }
+                    manifest_dir = dir.parent();
                 }
                 if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
@@ -124,6 +150,14 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
             "go" => {
                 let mut cmd = std::process::Command::new("go");
                 cmd.args(["vet", path.to_str().unwrap_or("")]);
+                let mut go_dir = path.parent();
+                while let Some(dir) = go_dir {
+                    if dir.join("go.mod").exists() {
+                        cmd.current_dir(dir);
+                        break;
+                    }
+                    go_dir = dir.parent();
+                }
                 if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -144,6 +178,14 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
             "ts" | "mts" | "cts" | "tsx" => {
                 let mut cmd = std::process::Command::new("tsc");
                 cmd.args(["--noEmit", path.to_str().unwrap_or("")]);
+                let mut ts_dir = path.parent();
+                while let Some(dir) = ts_dir {
+                    if dir.join("tsconfig.json").exists() || dir.join("package.json").exists() {
+                        cmd.current_dir(dir);
+                        break;
+                    }
+                    ts_dir = dir.parent();
+                }
                 if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -477,41 +519,76 @@ pub async fn run_server() -> anyhow::Result<()> {
                                                         }),
                                                     ))
                                                 } else if dry_run {
-                                                    let backup = content.clone();
-                                                    let updated = content.replacen(&target_orig, &target_new, 1);
-                                                    // In dry-run mode, stage write in place so native compilers (e.g. cargo check, go vet)
-                                                    // test within their natural module tree, then unconditionally restore the original backup.
-                                                    match boundary.write(&safe_path, updated.as_bytes()) {
-                                                        Ok(_) => {
-                                                            let verify_result = verify_patch(&safe_path);
-                                                            let _ = boundary.write(&safe_path, backup.as_bytes()); // Zero dirty diff guarantee
-                                                            match verify_result {
-                                                                Ok(_) => Some(success_response(
-                                                                    id.unwrap_or(Value::Null),
-                                                                    json!({
-                                                                        "content": [{ "type": "text", "text": "Dry-run succeeded: target code block matched uniquely and syntax verification passed. Target file was not modified." }],
-                                                                        "dry_run": true,
-                                                                        "status": "success"
-                                                                    }),
-                                                                )),
-                                                                Err(verify_err) => Some(success_response(
-                                                                    id.unwrap_or(Value::Null),
-                                                                    json!({
-                                                                        "content": [{ "type": "text", "text": format!("Dry-run verification failed: {}", verify_err) }],
-                                                                        "isError": true,
-                                                                        "dry_run": true
-                                                                    }),
-                                                                )),
+                                                    let is_rust = safe_path.extension().and_then(|e| e.to_str()) == Some("rs");
+                                                    if is_rust {
+                                                        let backup = content.clone();
+                                                        let updated = content.replacen(&target_orig, &target_new, 1);
+                                                        // In dry-run mode for Rust, stage write in place so cargo check
+                                                        // tests within the crate module tree, then unconditionally restore original backup.
+                                                        match boundary.write(&safe_path, updated.as_bytes()) {
+                                                            Ok(_) => {
+                                                                let verify_result = verify_patch(&safe_path);
+                                                                let _ = boundary.write(&safe_path, backup.as_bytes()); // Zero dirty diff guarantee
+                                                                match verify_result {
+                                                                    Ok(_) => Some(success_response(
+                                                                        id.unwrap_or(Value::Null),
+                                                                        json!({
+                                                                            "content": [{ "type": "text", "text": "Dry-run succeeded: target code block matched uniquely and syntax verification passed. Target file was not modified." }],
+                                                                            "dry_run": true,
+                                                                            "status": "success"
+                                                                        }),
+                                                                    )),
+                                                                    Err(verify_err) => Some(success_response(
+                                                                        id.unwrap_or(Value::Null),
+                                                                        json!({
+                                                                            "content": [{ "type": "text", "text": format!("Dry-run verification failed: {}", verify_err) }],
+                                                                            "isError": true,
+                                                                            "dry_run": true
+                                                                        }),
+                                                                    )),
+                                                                }
                                                             }
+                                                            Err(e) => Some(success_response(
+                                                                id.unwrap_or(Value::Null),
+                                                                json!({
+                                                                    "content": [{ "type": "text", "text": format!("Dry-run failed to stage temporary test content: {}", e) }],
+                                                                    "isError": true,
+                                                                    "dry_run": true
+                                                                }),
+                                                            )),
                                                         }
-                                                        Err(e) => Some(success_response(
-                                                            id.unwrap_or(Value::Null),
-                                                            json!({
-                                                                "content": [{ "type": "text", "text": format!("Dry-run failed to stage temporary test content: {}", e) }],
-                                                                "isError": true,
-                                                                "dry_run": true
-                                                            }),
-                                                        )),
+                                                    } else {
+                                                        // For non-Rust files (py, js, ts, go, json, toml, yaml, php), test against an isolated sandbox temp file
+                                                        // without ever touching or modifying the actual target file on disk!
+                                                        let updated = content.replacen(&target_orig, &target_new, 1);
+                                                        let ext = safe_path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+                                                        let temp_file = safe_path.with_file_name(format!(
+                                                            ".dry_run_{}.tmp.{}",
+                                                            std::process::id(),
+                                                            ext
+                                                        ));
+                                                        let _ = std::fs::write(&temp_file, updated.as_bytes());
+                                                        let verify_result = verify_patch(&temp_file);
+                                                        let _ = std::fs::remove_file(&temp_file);
+
+                                                        match verify_result {
+                                                            Ok(_) => Some(success_response(
+                                                                id.unwrap_or(Value::Null),
+                                                                json!({
+                                                                    "content": [{ "type": "text", "text": "Dry-run succeeded: target code block matched uniquely and syntax verification passed. Target file was not modified." }],
+                                                                    "dry_run": true,
+                                                                    "status": "success"
+                                                                }),
+                                                            )),
+                                                            Err(verify_err) => Some(success_response(
+                                                                id.unwrap_or(Value::Null),
+                                                                json!({
+                                                                    "content": [{ "type": "text", "text": format!("Dry-run verification failed: {}", verify_err) }],
+                                                                    "isError": true,
+                                                                    "dry_run": true
+                                                                }),
+                                                            )),
+                                                        }
                                                     }
                                                 } else {
                                                     let backup = content.clone();

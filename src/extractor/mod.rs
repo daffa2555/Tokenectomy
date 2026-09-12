@@ -18,35 +18,98 @@ pub trait TraceParser: Send + Sync {
     fn extract_locations(&self, log: &str) -> Vec<CodeLocation>;
 }
 
+/// Checks whether `component` appears in `text` enclosed by path or word boundaries
+/// (e.g. '/', '\', whitespace, quotes, parentheses, colon).
+/// Prevents false positives like 'vendor_portal' matching 'vendor', or 'chicago/src' matching 'go/src'.
+pub fn has_path_component(text: &str, component: &str) -> bool {
+    let bytes = text.as_bytes();
+    let comp_bytes = component.as_bytes();
+    if comp_bytes.is_empty() || bytes.len() < comp_bytes.len() {
+        return false;
+    }
+
+    let is_boundary = |b: u8| -> bool {
+        b == b'/'
+            || b == b'\\'
+            || b == b' '
+            || b == b'\t'
+            || b == b'"'
+            || b == b'\''
+            || b == b'('
+            || b == b')'
+            || b == b'['
+            || b == b']'
+            || b == b':'
+            || b == b'\r'
+            || b == b'\n'
+    };
+
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(component) {
+        let idx = start + pos;
+        let before_ok = if idx == 0 {
+            true
+        } else {
+            is_boundary(bytes[idx - 1])
+        };
+
+        let after_idx = idx + comp_bytes.len();
+        let after_ok = if after_idx == bytes.len() {
+            true
+        } else {
+            is_boundary(bytes[after_idx])
+        };
+
+        if before_ok && after_ok {
+            return true;
+        }
+
+        start = idx + 1;
+    }
+
+    false
+}
+
 /// Determines whether a file path or stack trace line represents framework, runtime, or dependency noise.
 pub fn is_framework_noise(line_or_path: &str) -> bool {
     let lower = line_or_path.to_lowercase();
     let trimmed = line_or_path.trim_start();
+    let path_norm = lower.replace('\\', "/");
 
-    // 1. Common file dependency directory substrings
-    let ignores = [
+    // 1. Exact path directory component matches (prevents false positives on 'vendor_portal', 'chicago/src', 'inventory')
+    let component_ignores = [
         "node_modules",        // JS/Node/TS
         "site-packages",       // Python
         "dist-packages",       // Python
         "venv",                // Python VirtualEnv
         ".venv",               // Python VirtualEnv
-        "lib/python",          // Python built-ins
+        "vendor",              // PHP/Go/Ruby dependencies
+        "gems",                // Ruby gems
+        "__pycache__",          // Python compiled bytecode
+        "vcpkg_installed",     // C++ vcpkg
+        ".gradle",             // Java Gradle cache
         ".cargo/registry",     // Rust
         ".rustup",             // Rust toolchain
-        "vendor",              // PHP/Go/Ruby
-        "gems",                // Ruby
         "pkg/mod",             // Go modules cache
         "go/src",              // Go standard library
-        ".gradle",             // Java Gradle cache
         ".m2/repository",      // Java Maven repo
         "usr/include",         // C/C++ system headers
         "usr/lib",             // C/C++ system libraries
-        "vcpkg_installed",     // C++ vcpkg
         "target/debug/build",  // Rust build scripts
+        "lib/python",          // Python built-ins
+        "internal/modules",    // Node.js internal CJS/ESM loader
+        "rustc",               // Rust standard library / compiler frames
+    ];
+
+    for ignore in component_ignores.iter() {
+        if has_path_component(&path_norm, ignore) {
+            return true;
+        }
+    }
+
+    // 2. Specific runtime protocol prefixes and markers
+    let runtime_markers = [
         "node:internal/",      // Node.js internal runtime
-        "internal/modules/",   // Node.js internal CJS/ESM loader
-        "rustc/",              // Rust standard library / compiler frames
-        "__pycache__",          // Python compiled bytecode
         "<frozen ",            // Python internal frozen modules & importlib
         "asyncio/base_events", // Python asyncio internals
         "asyncio/events.py",   // Python asyncio internals
@@ -54,12 +117,12 @@ pub fn is_framework_noise(line_or_path: &str) -> bool {
         "uvicorn/protocols/",  // Uvicorn server frames
         "gunicorn/workers/",   // Gunicorn worker frames
         "build/glibc-",        // Glibc internals
-        "System.Private.CoreLib", // .NET CoreLib
-        "Microsoft.AspNetCore.",  // ASP.NET Core
+        "system.private.corelib", // .NET CoreLib
+        "microsoft.aspnetcore.",  // ASP.NET Core
     ];
 
-    for ignore in ignores.iter() {
-        if lower.contains(ignore) {
+    for marker in runtime_markers.iter() {
+        if path_norm.contains(marker) {
             return true;
         }
     }
