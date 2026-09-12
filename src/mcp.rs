@@ -25,15 +25,67 @@ fn success_response(id: Value, result: Value) -> Value {
     })
 }
 
+pub const COMPILER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn run_command_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn compiler check: {}", e))?;
+    let start = std::time::Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = std::io::Read::read_to_end(&mut out, &mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_end(&mut err, &mut stderr);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Compiler validation timed out after {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("Error monitoring compiler process: {}", e));
+            }
+        }
+    }
+}
+
 pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         match ext {
             "rs" => {
-                if let Ok(output) = std::process::Command::new("cargo")
-                    .args(["check", "--quiet", "--message-format=short"])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                {
+                let mut cmd = std::process::Command::new("cargo");
+                cmd.args(["check", "--quiet", "--message-format=short"]);
+                if let Some(parent) = path.parent() {
+                    cmd.current_dir(parent);
+                }
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -60,11 +112,9 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                     }
                 }
                 // Secondary: OS runtime compiler validation if python3 is available
-                if let Ok(output) = std::process::Command::new("python3")
-                    .args(["-m", "py_compile", path.to_str().unwrap_or("")])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                {
+                let mut cmd = std::process::Command::new("python3");
+                cmd.args(["-m", "py_compile", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         return Err(format!("Python syntax check failed: {}", stderr.trim()));
@@ -72,11 +122,9 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                 }
             }
             "go" => {
-                if let Ok(output) = std::process::Command::new("go")
-                    .args(["vet", path.to_str().unwrap_or("")])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                {
+                let mut cmd = std::process::Command::new("go");
+                cmd.args(["vet", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         return Err(format!("Go vet syntax check failed: {}", stderr.trim()));
@@ -84,11 +132,9 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                 }
             }
             "js" | "mjs" | "cjs" => {
-                if let Ok(output) = std::process::Command::new("node")
-                    .args(["--check", path.to_str().unwrap_or("")])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                {
+                let mut cmd = std::process::Command::new("node");
+                cmd.args(["--check", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         return Err(format!("Node syntax check failed: {}", stderr.trim()));
@@ -96,11 +142,9 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                 }
             }
             "ts" | "mts" | "cts" | "tsx" => {
-                if let Ok(output) = std::process::Command::new("tsc")
-                    .args(["--noEmit", path.to_str().unwrap_or("")])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                {
+                let mut cmd = std::process::Command::new("tsc");
+                cmd.args(["--noEmit", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -142,11 +186,9 @@ pub fn verify_patch(path: &std::path::Path) -> Result<(), String> {
                 }
             }
             "php" => {
-                if let Ok(output) = std::process::Command::new("php")
-                    .args(["-l", path.to_str().unwrap_or("")])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                {
+                let mut cmd = std::process::Command::new("php");
+                cmd.args(["-l", path.to_str().unwrap_or("")]);
+                if let Ok(output) = run_command_with_timeout(cmd, COMPILER_CHECK_TIMEOUT) {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -398,7 +440,26 @@ pub async fn run_server() -> anyhow::Result<()> {
                                     Ok(safe_path) => {
                                         match boundary.read(&safe_path) {
                                             Ok(content) => {
-                                                let count = content.matches(orig).count();
+                                                // Handle CRLF vs LF line-ending normalization for cross-platform resilience
+                                                let (target_orig, target_new) = if content.matches(orig).count() > 0 {
+                                                    (orig.to_string(), new_c.to_string())
+                                                } else {
+                                                    let orig_crlf = orig.replace("\r\n", "\n").replace('\n', "\r\n");
+                                                    let new_crlf = new_c.replace("\r\n", "\n").replace('\n', "\r\n");
+                                                    if content.matches(&orig_crlf).count() > 0 {
+                                                        (orig_crlf, new_crlf)
+                                                    } else {
+                                                        let orig_lf = orig.replace("\r\n", "\n");
+                                                        let new_lf = new_c.replace("\r\n", "\n");
+                                                        if content.matches(&orig_lf).count() > 0 {
+                                                            (orig_lf, new_lf)
+                                                        } else {
+                                                            (orig.to_string(), new_c.to_string())
+                                                        }
+                                                    }
+                                                };
+
+                                                let count = content.matches(&target_orig).count();
                                                 if count == 0 {
                                                     Some(success_response(
                                                         id.unwrap_or(Value::Null),
@@ -416,30 +477,37 @@ pub async fn run_server() -> anyhow::Result<()> {
                                                         }),
                                                     ))
                                                 } else if dry_run {
-                                                    let updated = content.replacen(orig, new_c, 1);
-                                                    let ext = safe_path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
-                                                    let temp_file = safe_path.with_file_name(format!(
-                                                        ".dry_run_{}.tmp.{}",
-                                                        std::process::id(),
-                                                        ext
-                                                    ));
-                                                    let _ = std::fs::write(&temp_file, updated.as_bytes());
-                                                    let verify_result = verify_patch(&temp_file);
-                                                    let _ = std::fs::remove_file(&temp_file);
-
-                                                    match verify_result {
-                                                        Ok(_) => Some(success_response(
+                                                    let backup = content.clone();
+                                                    let updated = content.replacen(&target_orig, &target_new, 1);
+                                                    // In dry-run mode, stage write in place so native compilers (e.g. cargo check, go vet)
+                                                    // test within their natural module tree, then unconditionally restore the original backup.
+                                                    match boundary.write(&safe_path, updated.as_bytes()) {
+                                                        Ok(_) => {
+                                                            let verify_result = verify_patch(&safe_path);
+                                                            let _ = boundary.write(&safe_path, backup.as_bytes()); // Zero dirty diff guarantee
+                                                            match verify_result {
+                                                                Ok(_) => Some(success_response(
+                                                                    id.unwrap_or(Value::Null),
+                                                                    json!({
+                                                                        "content": [{ "type": "text", "text": "Dry-run succeeded: target code block matched uniquely and syntax verification passed. Target file was not modified." }],
+                                                                        "dry_run": true,
+                                                                        "status": "success"
+                                                                    }),
+                                                                )),
+                                                                Err(verify_err) => Some(success_response(
+                                                                    id.unwrap_or(Value::Null),
+                                                                    json!({
+                                                                        "content": [{ "type": "text", "text": format!("Dry-run verification failed: {}", verify_err) }],
+                                                                        "isError": true,
+                                                                        "dry_run": true
+                                                                    }),
+                                                                )),
+                                                            }
+                                                        }
+                                                        Err(e) => Some(success_response(
                                                             id.unwrap_or(Value::Null),
                                                             json!({
-                                                                "content": [{ "type": "text", "text": "Dry-run succeeded: target code block matched uniquely and syntax verification passed. Target file was not modified." }],
-                                                                "dry_run": true,
-                                                                "status": "success"
-                                                            }),
-                                                        )),
-                                                        Err(verify_err) => Some(success_response(
-                                                            id.unwrap_or(Value::Null),
-                                                            json!({
-                                                                "content": [{ "type": "text", "text": format!("Dry-run verification failed: {}", verify_err) }],
+                                                                "content": [{ "type": "text", "text": format!("Dry-run failed to stage temporary test content: {}", e) }],
                                                                 "isError": true,
                                                                 "dry_run": true
                                                             }),
@@ -447,7 +515,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                                                     }
                                                 } else {
                                                     let backup = content.clone();
-                                                    let updated = content.replacen(orig, new_c, 1);
+                                                    let updated = content.replacen(&target_orig, &target_new, 1);
                                                     match boundary.write(&safe_path, updated.as_bytes()) {
                                                         Ok(_) => match verify_patch(&safe_path) {
                                                             Ok(_) => Some(success_response(

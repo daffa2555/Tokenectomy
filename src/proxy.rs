@@ -259,6 +259,7 @@ pub async fn run_reverse_proxy_configured(
 
     loop {
         let (mut socket, peer_addr) = listener.accept().await?;
+        let _ = socket.set_nodelay(true);
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -578,6 +579,7 @@ pub async fn run_reverse_proxy_configured(
                             if socket.write_all(&chunk).await.is_err() {
                                 break;
                             }
+                            let _ = socket.flush().await;
                         }
                         let _ = socket.flush().await;
                     }

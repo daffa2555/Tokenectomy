@@ -73,11 +73,23 @@ pub fn extract_error_query(log: &str) -> Option<String> {
 }
 
 fn clean_query(raw: &str) -> String {
-    // Strip raw memory pointers (0x...) and file path fragments
+    // Strip raw memory pointers (0x...) and file path fragments, preserving language packages (e.g. net/http)
     let words: Vec<&str> = raw.split_whitespace().collect();
     let cleaned: Vec<&str> = words
         .into_iter()
-        .filter(|w| !w.starts_with("0x") && !w.contains('/') && !w.contains('\\'))
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            !w.starts_with("0x")
+                && !w.starts_with('/')
+                && !lower.starts_with("c:\\")
+                && !lower.starts_with("d:\\")
+                && !lower.contains("/home/")
+                && !lower.contains("/usr/")
+                && !lower.contains("/var/")
+                && !lower.contains("/etc/")
+                && !lower.contains("/app/")
+                && !lower.contains("/target/")
+        })
         .collect();
     let res = if cleaned.is_empty() {
         raw.to_string()

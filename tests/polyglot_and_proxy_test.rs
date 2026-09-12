@@ -765,6 +765,41 @@ fn test_adversarial_redos_and_extreme_inputs() {
     assert_eq!(tokenectomy::redact::redact_secrets(&truncated_sk), truncated_sk);
 }
 
+#[test]
+fn test_apply_code_patch_crlf_lf_resilience() {
+    let temp_dir = std::env::temp_dir().join(format!("test_crlf_mcp_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let file_path = temp_dir.join("sample.py");
 
+    // File on disk has CRLF line endings
+    let crlf_content = "def calculate(a, b):\r\n    total = a + b\r\n    return total\r\n";
+    std::fs::write(&file_path, crlf_content).unwrap();
 
+    let boundary = tokenectomy::workspace::WorkspaceBoundary::new(&temp_dir).unwrap();
+    let content = boundary.read(&file_path).unwrap();
 
+    // LLM sends LF line endings
+    let orig_lf = "    total = a + b\n    return total";
+    let new_lf = "    total = a + b + 10\n    return total";
+
+    // Test normalization matching logic
+    let orig_crlf = orig_lf.replace("\r\n", "\n").replace('\n', "\r\n");
+    let new_crlf = new_lf.replace("\r\n", "\n").replace('\n', "\r\n");
+    assert!(content.contains(&orig_crlf), "Should match normalized CRLF");
+
+    let updated = content.replacen(&orig_crlf, &new_crlf, 1);
+    boundary.write(&file_path, updated.as_bytes()).unwrap();
+
+    let disk_after = std::fs::read_to_string(&file_path).unwrap();
+    assert!(disk_after.contains("total = a + b + 10"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_search_query_preserves_language_packages() {
+    let log = "panic: runtime error in net/http: request handler failed at /home/runner/work/repo/main.go:88";
+    let query = tokenectomy::search::extract_error_query(log).expect("should extract query");
+    assert!(query.contains("net/http"), "Must preserve language packages like net/http");
+    assert!(!query.contains("/home/runner/"), "Must strip physical filesystem paths");
+}
